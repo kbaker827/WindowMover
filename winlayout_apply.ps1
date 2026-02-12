@@ -1,460 +1,534 @@
+<#
+.SYNOPSIS
+    Applies saved window layouts to restore window positions and sizes.
+
+.DESCRIPTION
+    Reads a JSON configuration file created by winlayout_record.ps1 and moves
+    windows to their saved positions. Supports multiple monitors, DPI scaling,
+    preset layouts, and automatic process launching.
+
+.PARAMETER Path
+    Path to the JSON layout config file. Default: "$env:USERPROFILE\windowlayout.config"
+
+.PARAMETER Process
+    When used with -Record, specifies which processes to capture.
+
+.PARAMETER Record
+    Record current layout instead of applying. Use with -Process.
+
+.PARAMETER RecordBundleName
+    When recording, save as a named bundle in the config file.
+
+.PARAMETER BundleToApply
+    Apply a specific named bundle from the config file.
+
+.PARAMETER DryRun
+    Show what would be done without actually moving windows.
+
+.EXAMPLE
+    .\winlayout_apply.ps1
+    Apply the default saved layout.
+
+.EXAMPLE
+    .\winlayout_apply.ps1 -Path "dev-setup.json"
+    Apply a specific layout file.
+
+.EXAMPLE
+    .\winlayout_apply.ps1 -BundleToApply "morning-setup"
+    Apply a named bundle from the config.
+
+.EXAMPLE
+    .\winlayout_apply.ps1 -Record -Process "chrome","code","notepad" -RecordBundleName "dev"
+    Record current positions of Chrome, VS Code, and Notepad as bundle "dev".
+
+.NOTES
+    Version: 2.1
+    Requires: Windows 8+ with PowerShell 5.1+
+    
+    Exit Codes:
+    0 - Success
+    1 - Error
+#>
+
+[CmdletBinding()]
 param(
-  [switch]$Record,
-  [string[]]$Process,
-  [string]$RecordBundleName,
-  [string]$BundleToApply,
-  [switch]$DryRun,
-  [string]$OutputPath
+    [string]$Path = (Join-Path $env:USERPROFILE 'windowlayout.config'),
+    [string[]]$Process,
+    [switch]$Record,
+    [string]$RecordBundleName,
+    [string]$BundleToApply,
+    [switch]$DryRun
 )
 
 #requires -Version 5.1
-Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $script:DryRun = $DryRun.IsPresent
 
-# =========================
-#  Win32 P/Invoke helpers
-# =========================
-try { [void][WindowNative] } catch {
-    Add-Type @"
+#region Win32 Interop
+$null = @'
 using System;
 using System.Runtime.InteropServices;
 
 [StructLayout(LayoutKind.Sequential)]
-public struct RECT
-{
-  public int Left;
-  public int Top;
-  public int Right;
-  public int Bottom;
+public struct RECT {
+    public int Left; public int Top; public int Right; public int Bottom;
 }
 
-public static class WindowNative
-{
-  [DllImport("user32.dll", SetLastError=true)]
-  public static extern bool MoveWindow(IntPtr hWnd, int X, int Y, int nWidth, int nHeight, bool bRepaint);
-
-  [DllImport("user32.dll", SetLastError=true)]
-  public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
-
-  [DllImport("user32.dll", SetLastError=true)]
-  public static extern bool IsWindowVisible(IntPtr hWnd);
-
-  [DllImport("user32.dll", SetLastError=true)]
-  public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
-
-  [DllImport("user32.dll", SetLastError=true)]
-  public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
-
-  [DllImport("user32.dll", EntryPoint="GetDpiForWindow")]
-  public static extern uint GetDpiForWindow(IntPtr hWnd);
+public class Win32 {
+    [DllImport("user32.dll", SetLastError=true)]
+    public static extern bool MoveWindow(IntPtr hWnd, int X, int Y, int nWidth, int nHeight, bool bRepaint);
+    
+    [DllImport("user32.dll", SetLastError=true)]
+    public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+    
+    [DllImport("user32.dll", SetLastError=true)]
+    public static extern bool IsWindowVisible(IntPtr hWnd);
+    
+    [DllImport("user32.dll", SetLastError=true)]
+    public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    
+    [DllImport("user32.dll", SetLastError=true)]
+    public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+    
+    [DllImport("user32.dll", EntryPoint="GetDpiForWindow")]
+    public static extern uint GetDpiForWindow(IntPtr hWnd);
+    
+    [DllImport("user32.dll")]
+    public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
 }
 
-public static class ShcoreNative
-{
-  [DllImport("shcore.dll")]
-  public static extern int GetDpiForSystem();
+public class Shcore {
+    [DllImport("shcore.dll")]
+    public static extern int GetDpiForSystem();
 }
-"@
+'@ | Add-Type -PassThru -ErrorAction SilentlyContinue
+#endregion
+
+#region Constants
+$script:SWP = @{
+    NOSIZE = 0x0001; NOMOVE = 0x0002; NOZORDER = 0x0004; NOREDRAW = 0x0008
+    NOACTIVATE = 0x0010; FRAMECHANGED = 0x0020; SHOWWINDOW = 0x0040
+    HIDEWINDOW = 0x0080; NOCOPYBITS = 0x0100; NOOWNERZORDER = 0x0200
 }
+$script:HWND = @{ TOP = [IntPtr]::Zero; TOPMOST = [IntPtr](-1); NOTOPMOST = [IntPtr](-2); BOTTOM = [IntPtr]1 }
 
-# =========================
-#   Config & Utilities
-# =========================
-$ConfigPath = Join-Path $env:USERPROFILE 'windowlayout.config'
-if (-not $OutputPath) { $OutputPath = $ConfigPath }
-
-function Read-WindowLayoutConfig {
-    param([string]$Path)
-    if (-not (Test-Path -LiteralPath $Path)) { throw "Config file not found: $Path" }
-    $json = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
-    if (-not $json) { throw "Config file is empty or invalid JSON: $Path" }
-    $json
+$script:Presets = @{
+    Full            = @{ Anchor = 'TopLeft'; WidthPct = 100; HeightPct = 100 }
+    LeftHalf        = @{ Anchor = 'Left'; WidthPct = 50; HeightPct = 100 }
+    RightHalf       = @{ Anchor = 'Right'; WidthPct = 50; HeightPct = 100 }
+    TopHalf         = @{ Anchor = 'Top'; WidthPct = 100; HeightPct = 50 }
+    BottomHalf      = @{ Anchor = 'Bottom'; WidthPct = 100; HeightPct = 50 }
+    LeftThird       = @{ Anchor = 'TopLeft'; WidthPct = 33.333; HeightPct = 100 }
+    CenterThird     = @{ Anchor = 'Top'; WidthPct = 33.333; HeightPct = 100 }
+    RightThird      = @{ Anchor = 'TopRight'; WidthPct = 33.333; HeightPct = 100 }
+    LeftTwoThirds   = @{ Anchor = 'Left'; WidthPct = 66.666; HeightPct = 100 }
+    RightTwoThirds  = @{ Anchor = 'Right'; WidthPct = 66.666; HeightPct = 100 }
+    TopLeftQuarter  = @{ Grid = '2x2'; Cell = '1,1' }
+    TopRightQuarter = @{ Grid = '2x2'; Cell = '1,2' }
+    BottomLeftQuarter = @{ Grid = '2x2'; Cell = '2,1' }
+    BottomRightQuarter = @{ Grid = '2x2'; Cell = '2,2' }
+    CenteredLarge   = @{ Anchor = 'Center'; WidthPct = 70; HeightPct = 70 }
 }
+#endregion
 
-function Get-Screens { Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.Screen]::AllScreens }
-function Get-WorkingArea { param([int]$MonitorIndex=-1)
+#region Helper Functions
+Add-Type -AssemblyName System.Windows.Forms | Out-Null
+
+function Get-Screens { return [System.Windows.Forms.Screen]::AllScreens }
+
+function Get-WorkingArea {
+    param([int]$MonitorIndex = -1)
     $screens = Get-Screens
-    if ($MonitorIndex -ge 0 -and $MonitorIndex -lt $screens.Count) { return $screens[$MonitorIndex].WorkingArea }
+    if ($MonitorIndex -ge 0 -and $MonitorIndex -lt $screens.Count) {
+        return $screens[$MonitorIndex].WorkingArea
+    }
     return ($screens | Where-Object { $_.Primary }).WorkingArea
 }
-function Get-ScreenIndexFromHandle {
+
+function Get-MonitorFromHandle {
     param([IntPtr]$Handle)
-    Add-Type -AssemblyName System.Windows.Forms
     $target = [System.Windows.Forms.Screen]::FromHandle($Handle)
-    $all = [System.Windows.Forms.Screen]::AllScreens
-    for ($i=0; $i -lt $all.Count; $i++){ if ($all[$i].DeviceName -eq $target.DeviceName) { return $i } }
+    $screens = Get-Screens
+    for ($i = 0; $i -lt $screens.Count; $i++) {
+        if ($screens[$i].DeviceName -eq $target.DeviceName) { return $i }
+    }
     return -1
 }
 
-function Get-EligibleMainWindowHandles {
-    param([Parameter(Mandatory)][string]$ProcessName,[string]$WindowTitlePattern)
-    $procs = Get-Process -Name $ProcessName -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 }
-    if ($WindowTitlePattern) { $procs = $procs | Where-Object { $_.MainWindowTitle -match $WindowTitlePattern } }
-    $eligible = foreach ($p in $procs) {
+function Get-WindowHandles {
+    param([string]$ProcessName, [string]$TitlePattern)
+    
+    $procs = Get-Process -Name $ProcessName -ErrorAction SilentlyContinue | 
+        Where-Object { $_.MainWindowHandle -ne 0 }
+    
+    if ($TitlePattern) {
+        $procs = $procs | Where-Object { $_.MainWindowTitle -match $TitlePattern }
+    }
+    
+    $results = foreach ($p in $procs) {
         $h = [IntPtr]$p.MainWindowHandle
-        if ($h -ne [IntPtr]::Zero -and [WindowNative]::IsWindowVisible($h)) { [PSCustomObject]@{ Process=$p; Handle=$h } }
+        if ($h -ne [IntPtr]::Zero -and [Win32]::IsWindowVisible($h)) {
+            [PSCustomObject]@{ Process = $p; Handle = $h }
+        }
     }
-    $eligible | Sort-Object { $_.Process.StartTime } -Descending
+    return $results | Sort-Object { $_.Process.StartTime } -Descending
 }
 
-function Ensure-Restored { param([IntPtr]$Handle) [void][WindowNative]::ShowWindow($Handle, 9) } # SW_RESTORE
+function Expand-EnvVars { param([string]$s) return [Environment]::ExpandEnvironmentVariables($s) }
 
-function Clamp-ToArea {
-    param([System.Drawing.Rectangle]$Area,[int]$X,[int]$Y,[int]$Width,[int]$Height)
-    $nx = [Math]::Max($Area.Left, [Math]::Min($X, $Area.Right  - 50))
-    $ny = [Math]::Max($Area.Top,  [Math]::Min($Y, $Area.Bottom - 50))
-    $nw = [Math]::Min([Math]::Max(50, $Width),  $Area.Width)
-    $nh = [Math]::Min([Math]::Max(50, $Height), $Area.Height)
-    [PSCustomObject]@{ X=[int]$nx; Y=[int]$ny; Width=[int]$nw; Height=[int]$nh }
-}
-function Get-AreaWithPad { param([System.Drawing.Rectangle]$Area,[int]$Pad=0)
-    if ($Pad -le 0) { return $Area }
-    [System.Drawing.Rectangle]::FromLTRB($Area.Left+$Pad,$Area.Top+$Pad,$Area.Right-$Pad,$Area.Bottom-$Pad)
-}
+function Is-ProcessRunning { param([string]$Name) return [bool](Get-Process -Name $Name -ErrorAction SilentlyContinue) }
 
-# -------- Presets (single-window sugar) ----------
-$__PresetMap = @{
-  'Full'            = @{ anchor='TopLeft'; widthPct=100; heightPct=100 }
-  'LeftHalf'        = @{ anchor='Left'; widthPct=50; heightPct=100 }
-  'RightHalf'       = @{ anchor='Right'; widthPct=50; heightPct=100 }
-  'TopHalf'         = @{ anchor='Top'; widthPct=100; heightPct=50 }
-  'BottomHalf'      = @{ anchor='Bottom'; widthPct=100; heightPct=50 }
-  'LeftThird'       = @{ anchor='TopLeft'; widthPct=33.333; heightPct=100 }
-  'CenterThird'     = @{ anchor='Top'; widthPct=33.333; heightPct=100 }
-  'RightThird'      = @{ anchor='TopRight'; widthPct=33.333; heightPct=100 }
-  'LeftTwoThirds'   = @{ anchor='Left'; widthPct=66.666; heightPct=100 }
-  'RightTwoThirds'  = @{ anchor='Right'; widthPct=66.666; heightPct=100 }
-  'TopLeftQuarter'  = @{ grid='2x2'; cell='1,1' }
-  'TopRightQuarter' = @{ grid='2x2'; cell='1,2' }
-  'BottomLeftQuarter' = @{ grid='2x2'; cell='2,1' }
-  'BottomRightQuarter'= @{ grid='2x2'; cell='2,2' }
-  'CenteredLarge'   = @{ anchor='Center'; widthPct=70; heightPct=70 }
-}
-function Apply-PresetToEntry {
-    param([pscustomobject]$Entry)
-    if (-not $Entry.preset) { return $Entry }
-    $key = $Entry.preset.ToString()
-    $base = $__PresetMap[$key]; if (-not $base) { throw "Unknown preset '$key'." }
-    $merged = [ordered]@{}; foreach ($k in $base.Keys) { $merged[$k]=$base[$k] }; foreach ($p in $Entry.PSObject.Properties){ $merged[$p.Name]=$p.Value }
-    [pscustomobject]$merged
-}
-
-# -------- Grid & Anchors ----------
-function Parse-Grid { param([string]$GridText)
-    if (-not $GridText -or $GridText -notmatch '^\s*(\d+)\s*x\s*(\d+)\s*$') { return $null }
-    [PSCustomObject]@{ Rows=[int]$Matches[1]; Cols=[int]$Matches[2] }
-}
-function Compute-FromGrid {
-    param([System.Drawing.Rectangle]$Area,[pscustomobject]$Entry)
-    $g = Parse-Grid -GridText $Entry.grid
-    if (-not $g) { return $null }
-    $rows=[Math]::Max(1,$g.Rows); $cols=[Math]::Max(1,$g.Cols)
-    if (-not $Entry.cell -or $Entry.cell -notmatch '^\s*(\d+)\s*,\s*(\d+)\s*$') { throw "grid specified but cell missing/invalid (use 'row,col')." }
-    $r=[int]$Matches[1]; $c=[int]$Matches[2]
-    $rowSpan=[int]($Entry.rowSpan ?? 1); $colSpan=[int]($Entry.colSpan ?? 1)
-    if ($r -lt 1 -or $r -gt $rows -or $c -lt 1 -or $c -gt $cols) { throw "cell ($r,$c) out of bounds ($rows x $cols)." }
-    $gutter=[int]($Entry.gutter ?? 0); $outer=[int]($Entry.outerGutter ?? 0)
-    $A = if ($outer -gt 0){[System.Drawing.Rectangle]::FromLTRB($Area.Left+$outer,$Area.Top+$outer,$Area.Right-$outer,$Area.Bottom-$outer)} else {$Area}
-    $cellW=[double]($A.Width-($cols-1)*$gutter)/$cols; $cellH=[double]($A.Height-($rows-1)*$gutter)/$rows
-    $spanW=[int]([Math]::Round($cellW*$colSpan + $gutter*($colSpan-1))); $spanH=[int]([Math]::Round($cellH*$rowSpan + $gutter*($rowSpan-1)))
-    $x=[int]([Math]::Round($A.Left + ($c-1)*($cellW+$gutter))); $y=[int]([Math]::Round($A.Top + ($r-1)*($cellH+$gutter)))
-    [PSCustomObject]@{ X=$x; Y=$y; Width=$spanW; Height=$spanH }
-}
-function Compute-FromAnchor {
-    param([System.Drawing.Rectangle]$Area,[pscustomobject]$Entry)
-    $w = if ($Entry.widthPct -ne $null){[int]([double]$Entry.widthPct/100.0*$Area.Width)} elseif ($Entry.width -ne $null){[int]$Entry.width}else{$Area.Width}
-    $h = if ($Entry.heightPct -ne $null){[int]([double]$Entry.heightPct/100.0*$Area.Height)} elseif ($Entry.height -ne $null){[int]$Entry.height}else{$Area.Height}
-    $anc = ($Entry.anchor ?? 'TopLeft').ToString()
-    switch -Regex ($anc) {
-        '^(TopLeft|TL)$'        {$x=$Area.Left; $y=$Area.Top}
-        '^(Top|T)$'             {$x=$Area.Left+($Area.Width-$w)/2; $y=$Area.Top}
-        '^(TopRight|TR)$'       {$x=$Area.Right-$w; $y=$Area.Top}
-        '^(Left|L)$'            {$x=$Area.Left; $y=$Area.Top+($Area.Height-$h)/2}
-        '^(Center|C|Middle)$'   {$x=$Area.Left+($Area.Width-$w)/2; $y=$Area.Top+($Area.Height-$h)/2}
-        '^(Right|R)$'           {$x=$Area.Right-$w; $y=$Area.Top+($Area.Height-$h)/2}
-        '^(BottomLeft|BL)$'     {$x=$Area.Left; $y=$Area.Bottom-$h}
-        '^(Bottom|B)$'          {$x=$Area.Left+($Area.Width-$w)/2; $y=$Area.Bottom-$h}
-        '^(BottomRight|BR)$'    {$x=$Area.Right-$w; $y=$Area.Bottom-$h}
-        default                 {$x=$Area.Left; $y=$Area.Top}
-    }
-    Clamp-ToArea -Area $Area -X ([int][Math]::Round($x)) -Y ([int][Math]::Round($y)) -Width $w -Height $h
-}
-
-# -------- DPI helpers ----------
-function Get-DpiForHandle { param([IntPtr]$Handle) try { [int][WindowNative]::GetDpiForWindow($Handle) } catch { $null } }
-function Get-SystemDpi   { try { [int][ShcoreNative]::GetDpiForSystem() } catch { 96 } }
-function Adjust-ForDpi {
-    param([pscustomobject]$Rect,[IntPtr]$Handle,[string]$Mode='auto')
-    $scale = $null
-    if ($Mode -eq 'logical') { return $Rect }
-    if ($Mode -eq 'auto')    { $dpi = Get-DpiForHandle -Handle $Handle; if ($dpi) { $scale = $dpi/96.0 } else { return $Rect } }
-    if ($Mode -eq 'physical'){ $dpi = (Get-DpiForHandle -Handle $Handle) ?? (Get-SystemDpi); $scale = $dpi/96.0 }
-    if (-not $scale -or [Math]::Abs($scale-1.0) -lt 0.01) { return $Rect }
-    [pscustomobject]@{
-        X=[int][Math]::Round($Rect.X*$scale); Y=[int][Math]::Round($Rect.Y*$scale);
-        Width=[int][Math]::Round($Rect.Width*$scale); Height=[int][Math]::Round($Rect.Height*$scale)
-    }
-}
-
-# -------- Rect planner ----------
-function Compute-RectFromEntry {
-    param([pscustomobject]$Entry)
-    $wa0 = Get-WorkingArea -MonitorIndex ($Entry.monitorIndex ?? -1)
-    $wa  = Get-AreaWithPad -Area $wa0 -Pad ([int]($Entry.pad ?? 0))
-
-    # 1) grid
-    $gr = Compute-FromGrid -Area $wa -Entry $Entry
-    if ($gr) { return (Clamp-ToArea -Area $wa -X $gr.X -Y $gr.Y -Width $gr.Width -Height $gr.Height) }
-
-    # 2) anchor
-    if ($Entry.PSObject.Properties.Name -contains 'anchor') { return (Compute-FromAnchor -Area $wa -Entry $Entry) }
-
-    # 3) explicit/percent
-    $w = if ($Entry.widthPct -ne $null){[int]([double]$Entry.widthPct/100.0*$wa.Width)} elseif ($Entry.width -ne $null){[int]$Entry.width}else{$wa.Width}
-    $h = if ($Entry.heightPct -ne $null){[int]([double]$Entry.heightPct/100.0*$wa.Height)} elseif ($Entry.height -ne $null){[int]$Entry.height}else{$wa.Height}
-    $x = if ($Entry.xPct -ne $null){[int]($wa.Left + ([double]$Entry.xPct/100.0*$wa.Width))} elseif ($Entry.x -ne $null){[int]($wa.Left + [int]$Entry.x)} else {$wa.Left}
-    $y = if ($Entry.yPct -ne $null){[int]($wa.Top  + ([double]$Entry.yPct/100.0*$wa.Height))} elseif ($Entry.y -ne $null){[int]($wa.Top + [int]$Entry.y)} else {$wa.Top}
-    Clamp-ToArea -Area $wa -X $x -Y $y -Width $w -Height $h
-}
-
-# -------- Move via MoveWindow or SetWindowPos ----------
-$__SWP = @{
-  'NOSIZE'=0x0001; 'NOMOVE'=0x0002; 'NOZORDER'=0x0004; 'NOREDRAW'=0x0008; 'NOACTIVATE'=0x0010;
-  'FRAMECHANGED'=0x0020; 'SHOWWINDOW'=0x0040; 'HIDEWINDOW'=0x0080; 'NOCOPYBITS'=0x0100;
-  'NOOWNERZORDER'=0x0200; 'NOSENDCHANGING'=0x0400; 'ASYNCWINDOWPOS'=0x4000
-}
-$__HWND = @{ 'TOP'=[IntPtr]::Zero; 'TOPMOST'=[IntPtr](-1); 'NOTOPMOST'=[IntPtr](-2); 'BOTTOM'=[IntPtr]1 }
-
-function Move-WindowSmart {
-    param([IntPtr]$Handle,[pscustomobject]$Rect,[pscustomobject]$Entry)
-    Ensure-Restored -Handle $Handle
-
-    $dpiMode = ($Entry.dpiMode ?? 'auto').ToString().ToLower()
-    $physRect = Adjust-ForDpi -Rect $Rect -Handle $Handle -Mode $dpiMode
-
-    if ($script:DryRun) {
-        Write-Host "[DRYRUN] would move -> ($($physRect.X),$($physRect.Y),$($physRect.Width),$($physRect.Height))"
+function Invoke-Launch {
+    param([PSCustomObject]$Entry)
+    
+    if (-not ($Entry.ensureRunning -or $Entry.launchPath)) { return }
+    if (Is-ProcessRunning -Name $Entry.processName) { return }
+    
+    $launchPath = Expand-EnvVars $Entry.launchPath
+    if (-not $launchPath) {
+        Write-Warning "ensureRunning for '$($Entry.processName)' but no launchPath provided"
         return
     }
+    
+    Write-Host "[LAUNCH] $($Entry.processName) -> $launchPath" -ForegroundColor Cyan
+    if ($script:DryRun) { Write-Host "[DRYRUN] Launch skipped"; return }
+    
+    $params = @{
+        FilePath = $launchPath
+        WorkingDirectory = (Expand-EnvVars ($Entry.launchWorkingDir ?? (Split-Path $launchPath)))
+        ErrorAction = 'Stop'
+    }
+    if ($Entry.launchArgs) { $params['ArgumentList'] = $Entry.launchArgs }
+    if (($Entry.launchAsUser -eq 'elevated')) { $params['Verb'] = 'runas' }
+    
+    try { Start-Process @params } catch { throw "Launch failed: $($_.Exception.Message)" }
+    
+    $delay = [int]($Entry.postLaunchDelaySeconds ?? 0)
+    if ($delay -gt 0) { Start-Sleep -Seconds $delay }
+}
 
+function Wait-ForWindow {
+    param([string]$ProcessName, [string]$TitlePattern, [int]$Retries = 0, [int]$Delay = 1)
+    for ($i = 0; $i -le $Retries; $i++) {
+        $found = Get-WindowHandles -ProcessName $ProcessName -TitlePattern $TitlePattern | Select-Object -First 1
+        if ($found) { return $found }
+        if ($i -lt $Retries) { Start-Sleep -Seconds $Delay }
+    }
+    return $null
+}
+
+function Get-Dpi {
+    param([IntPtr]$Handle)
+    try { return [int][Win32]::GetDpiForWindow($Handle) } catch { return $null }
+}
+
+function Get-SystemDpi { try { return [int][Shcore]::GetDpiForSystem() } catch { return 96 } }
+
+function Adjust-RectForDpi {
+    param([PSCustomObject]$Rect, [IntPtr]$Handle, [string]$Mode = 'auto')
+    
+    if ($Mode -eq 'logical') { return $Rect }
+    
+    $dpi = if ($Mode -eq 'auto') { Get-Dpi -Handle $Handle } else { (Get-Dpi -Handle $Handle) ?? (Get-SystemDpi) }
+    if (-not $dpi -or [Math]::Abs($dpi - 96) -lt 0.01) { return $Rect }
+    
+    $scale = $dpi / 96.0
+    return [PSCustomObject]@{
+        X = [int][Math]::Round($Rect.X * $scale)
+        Y = [int][Math]::Round($Rect.Y * $scale)
+        Width = [int][Math]::Round($Rect.Width * $scale)
+        Height = [int][Math]::Round($Rect.Height * $scale)
+    }
+}
+
+function Clamp-Rect {
+    param([System.Drawing.Rectangle]$Area, [int]$X, [int]$Y, [int]$Width, [int]$Height)
+    return [PSCustomObject]@{
+        X = [Math]::Max($Area.Left, [Math]::Min($X, $Area.Right - 50))
+        Y = [Math]::Max($Area.Top, [Math]::Min($Y, $Area.Bottom - 50))
+        Width = [Math]::Min([Math]::Max(50, $Width), $Area.Width)
+        Height = [Math]::Min([Math]::Max(50, $Height), $Area.Height)
+    }
+}
+
+function Apply-Pad { param([System.Drawing.Rectangle]$Area, [int]$Pad = 0) 
+    if ($Pad -le 0) { return $Area }
+    return [System.Drawing.Rectangle]::FromLTRB($Area.Left + $Pad, $Area.Top + $Pad, $Area.Right - $Pad, $Area.Bottom - $Pad)
+}
+
+function Parse-Grid { param([string]$Text) 
+    if ($Text -match '(\d+)\s*x\s*(\d+)') { 
+        return @{ Rows = [int]$matches[1]; Cols = [int]$matches[2] }
+    }
+    return $null
+}
+
+function Compute-FromGrid {
+    param([System.Drawing.Rectangle]$Area, [PSCustomObject]$Entry)
+    
+    $g = Parse-Grid -Text $Entry.grid
+    if (-not $g) { return $null }
+    
+    if (-not ($Entry.cell -match '(\d+)\s*,\s*(\d+)')) { throw "Invalid cell format. Use 'row,col'" }
+    $row = [int]$matches[1]; $col = [int]$matches[2]
+    $rowSpan = [int]($Entry.rowSpan ?? 1); $colSpan = [int]($Entry.colSpan ?? 1)
+    $gutter = [int]($Entry.gutter ?? 0); $outer = [int]($Entry.outerGutter ?? 0)
+    
+    $a = if ($outer -gt 0) { Apply-Pad -Area $Area -Pad $outer } else { $Area }
+    $cellW = [double]($a.Width - ($g.Cols - 1) * $gutter) / $g.Cols
+    $cellH = [double]($a.Height - ($g.Rows - 1) * $gutter) / $g.Rows
+    
+    $spanW = [int]([Math]::Round($cellW * $colSpan + $gutter * ($colSpan - 1)))
+    $spanH = [int]([Math]::Round($cellH * $rowSpan + $gutter * ($rowSpan - 1)))
+    $x = [int]([Math]::Round($a.Left + ($col - 1) * ($cellW + $gutter)))
+    $y = [int]([Math]::Round($a.Top + ($row - 1) * ($cellH + $gutter)))
+    
+    return Clamp-Rect -Area $a -X $x -Y $y -Width $spanW -Height $spanH
+}
+
+function Compute-FromAnchor {
+    param([System.Drawing.Rectangle]$Area, [PSCustomObject]$Entry)
+    
+    $w = if ($Entry.widthPct) { [int]($Entry.widthPct / 100.0 * $Area.Width) } 
+         elseif ($Entry.width) { [int]$Entry.width } else { $Area.Width }
+    $h = if ($Entry.heightPct) { [int]($Entry.heightPct / 100.0 * $Area.Height) }
+         elseif ($Entry.height) { [int]$Entry.height } else { $Area.Height }
+    
+    $anc = ($Entry.anchor ?? 'TopLeft').ToString()
+    switch -Regex ($anc) {
+        '^(TopLeft|TL)$' { $x = $Area.Left; $y = $Area.Top }
+        '^(Top|T)$' { $x = $Area.Left + ($Area.Width - $w) / 2; $y = $Area.Top }
+        '^(TopRight|TR)$' { $x = $Area.Right - $w; $y = $Area.Top }
+        '^(Left|L)$' { $x = $Area.Left; $y = $Area.Top + ($Area.Height - $h) / 2 }
+        '^(Center|C|Middle)$' { $x = $Area.Left + ($Area.Width - $w) / 2; $y = $Area.Top + ($Area.Height - $h) / 2 }
+        '^(Right|R)$' { $x = $Area.Right - $w; $y = $Area.Top + ($Area.Height - $h) / 2 }
+        '^(BottomLeft|BL)$' { $x = $Area.Left; $y = $Area.Bottom - $h }
+        '^(Bottom|B)$' { $x = $Area.Left + ($Area.Width - $w) / 2; $y = $Area.Bottom - $h }
+        '^(BottomRight|BR)$' { $x = $Area.Right - $w; $y = $Area.Bottom - $h }
+        default { $x = $Area.Left; $y = $Area.Top }
+    }
+    return Clamp-Rect -Area $Area -X ([int][Math]::Round($x)) -Y ([int][Math]::Round($y)) -Width $w -Height $h
+}
+
+function Compute-Rect {
+    param([PSCustomObject]$Entry)
+    
+    $wa = Get-WorkingArea -MonitorIndex ($Entry.monitorIndex ?? -1)
+    $wa = Apply-Pad -Area $wa -Pad ([int]($Entry.pad ?? 0))
+    
+    # Try grid first
+    $grid = Compute-FromGrid -Area $wa -Entry $Entry
+    if ($grid) { return $grid }
+    
+    # Then anchor
+    if ($Entry.anchor) { return Compute-FromAnchor -Area $wa -Entry $Entry }
+    
+    # Explicit values
+    $w = if ($Entry.widthPct) { [int]($Entry.widthPct / 100.0 * $wa.Width) }
+         elseif ($Entry.width) { [int]$Entry.width } else { $wa.Width }
+    $h = if ($Entry.heightPct) { [int]($Entry.heightPct / 100.0 * $wa.Height) }
+         elseif ($Entry.height) { [int]$Entry.height } else { $wa.Height }
+    $x = if ($Entry.xPct) { [int]($wa.Left + $Entry.xPct / 100.0 * $wa.Width) }
+         elseif ($Entry.x -ne $null) { [int]($wa.Left + $Entry.x) } else { $wa.Left }
+    $y = if ($Entry.yPct) { [int]($wa.Top + $Entry.yPct / 100.0 * $wa.Height) }
+         elseif ($Entry.y -ne $null) { [int]($wa.Top + $Entry.y) } else { $wa.Top }
+    
+    return Clamp-Rect -Area $wa -X $x -Y $y -Width $w -Height $h
+}
+
+function Apply-Preset($Entry) {
+    if (-not $Entry.preset) { return $Entry }
+    $key = $Entry.preset.ToString()
+    if (-not $script:Presets.ContainsKey($key)) { throw "Unknown preset: $key" }
+    
+    $merged = [ordered]@{}
+    foreach ($k in $script:Presets[$key].Keys) { $merged[$k] = $script:Presets[$key][$k] }
+    foreach ($p in $Entry.PSObject.Properties) { $merged[$p.Name] = $p.Value }
+    return [PSCustomObject]$merged
+}
+
+function Move-Window {
+    param([IntPtr]$Handle, [PSCustomObject]$Rect, [PSCustomObject]$Entry)
+    
+    # Restore window if minimized
+    [void][Win32]::ShowWindow($Handle, 9) # SW_RESTORE
+    
+    $phys = Adjust-RectForDpi -Rect $Rect -Handle $Handle -Mode ($Entry.dpiMode ?? 'auto')
+    
+    if ($script:DryRun) {
+        Write-Host "[DRYRUN] Would move to ($($phys.X),$($phys.Y),$($phys.Width),$($phys.Height))" -ForegroundColor Yellow
+        return
+    }
+    
     if ($Entry.useSetWindowPos) {
         $flags = 0
         foreach ($f in ($Entry.setWindowPosFlags ?? @('NOZORDER','NOACTIVATE'))) {
-            $name = $f.ToString().ToUpper()
-            if ($__SWP.ContainsKey($name)) { $flags = $flags -bor $__SWP[$name] }
+            $key = $f.ToString().ToUpper()
+            if ($script:SWP.ContainsKey($key)) { $flags = $flags -bor $script:SWP[$key] }
         }
-        $insertAfter = $__HWND[ ($Entry.zOrder ?? 'TOP') ]
-        $ok = [WindowNative]::SetWindowPos($Handle,$insertAfter,$physRect.X,$physRect.Y,$physRect.Width,$physRect.Height,[uint32]$flags)
-        if (-not $ok) { $code = [Runtime.InteropServices.Marshal]::GetLastWin32Error(); throw "SetWindowPos failed [Win32=$code]" }
+        $insert = $script:HWND[($Entry.zOrder ?? 'TOP')]
+        $ok = [Win32]::SetWindowPos($Handle, $insert, $phys.X, $phys.Y, $phys.Width, $phys.Height, [uint32]$flags)
+        if (-not $ok) { throw "SetWindowPos failed (Win32: $([Runtime.InteropServices.Marshal]::GetLastWin32Error()))" }
     } else {
-        $ok = [WindowNative]::MoveWindow($Handle,$physRect.X,$physRect.Y,$physRect.Width,$physRect.Height,$true)
-        if (-not $ok) { $code = [Runtime.InteropServices.Marshal]::GetLastWin32Error(); throw "MoveWindow failed [Win32=$code]" }
+        $ok = [Win32]::MoveWindow($Handle, $phys.X, $phys.Y, $phys.Width, $phys.Height, $true)
+        if (-not $ok) { throw "MoveWindow failed (Win32: $([Runtime.InteropServices.Marshal]::GetLastWin32Error()))" }
     }
 }
 
-# -------- Launch helpers ----------
-function Expand-EnvText { param([string]$s) if (-not $s) { return $s }; return [Environment]::ExpandEnvironmentVariables($s) }
-function Is-ProcessRunning { param([string]$Name) (Get-Process -Name $Name -ErrorAction SilentlyContinue) -ne $null }
-
-function Launch-IfNeeded {
-    param([pscustomobject]$Entry)
-
-    $ensure = [bool]($Entry.ensureRunning ?? $false)
-    if (-not $ensure) { return }
-
-    $procName = $Entry.processName
-    if (Is-ProcessRunning -Name $procName) { return }
-
-    $path = Expand-EnvText ($Entry.launchPath ?? '')
-    if (-not $path) {
-        Write-Warning "ensureRunning=true for '$procName' but no launchPath provided; will wait for process if it starts elsewhere."
-        return
-    }
-    $args = $Entry.launchArgs
-    $cwd  = Expand-EnvText ($Entry.launchWorkingDir ?? [IO.Path]::GetDirectoryName($path))
-    $verb = (($Entry.launchAsUser ?? 'current').ToString().ToLower() -eq 'elevated') ? 'runas' : $null
-
-    Write-Host "[LAUNCH] $procName -> $path $args"
-    if ($script:DryRun) { Write-Host "[DRYRUN] (launch skipped)"; return }
-
-    $si = @{
-        FilePath     = $path
-        WorkingDirectory = $cwd
-        ErrorAction  = 'Stop'
-    }
-    if ($args) { $si['ArgumentList'] = $args }
-    if ($verb) { $si['Verb'] = $verb }
-
-    try { Start-Process @si } catch { throw "Failed to launch '$procName' at '$path': $($_.Exception.Message)" }
-
-    $postDelay = [int]($Entry.postLaunchDelaySeconds ?? 0)
-    if ($postDelay -gt 0) { Start-Sleep -Seconds $postDelay }
-}
-
-# -------- Orchestration ----------
-function Wait-ForProcessWindow {
-    param([string]$ProcessName,[string]$WindowTitlePattern,[int]$RetryCount=0,[int]$RetryDelaySeconds=1)
-    $try = 0
-    while ($true) {
-        $eligible = Get-EligibleMainWindowHandles -ProcessName $ProcessName -WindowTitlePattern $WindowTitlePattern
-        if ($eligible) { return ($eligible | Select-Object -First 1) }
-        if ($try -ge $RetryCount) { return $null }
-        Start-Sleep -Seconds $RetryDelaySeconds
-        $try++
-    }
-}
-
-function Apply-WindowLayoutEntry {
-    param([pscustomobject]$EntryRaw,[pscustomobject]$BundleDefaults)
-
-    # Merge bundle defaults -> entry -> preset
-    $EntryMerged = if ($BundleDefaults) {
-        $m=[ordered]@{}; foreach($p in $BundleDefaults.PSObject.Properties){$m[$p.Name]=$p.Value}
-        foreach($p in $EntryRaw.PSObject.Properties){$m[$p.Name]=$p.Value}
-        [pscustomobject]$m
-    } else { $EntryRaw }
-
-    $Entry = Apply-PresetToEntry -Entry $EntryMerged
-    $procName = $Entry.processName
-    if (-not $procName) { throw "Config entry missing 'processName': $($Entry | ConvertTo-Json -Compress)" }
-
-    # Optional initial wait
-    $wait = [int]($Entry.waitForSeconds ?? 0)
-    if ($wait -gt 0) { Write-Host ("[WAIT] {0}s before targeting '{1}'" -f $wait,$procName); Start-Sleep -Seconds $wait }
-
+function Apply-Entry {
+    param([PSCustomObject]$Entry, [PSCustomObject]$Defaults)
+    
+    # Merge defaults
+    $merged = if ($Defaults) {
+        $m = [ordered]@{}
+        foreach ($p in $Defaults.PSObject.Properties) { $m[$p.Name] = $p.Value }
+        foreach ($p in $Entry.PSObject.Properties) { $m[$p.Name] = $p.Value }
+        [PSCustomObject]$m
+    } else { $Entry }
+    
+    $merged = Apply-Preset -Entry $merged
+    $procName = $merged.processName
+    if (-not $procName) { throw "Entry missing processName" }
+    
+    # Wait before targeting
+    $wait = [int]($merged.waitForSeconds ?? 0)
+    if ($wait -gt 0) { Write-Host "[WAIT] ${wait}s before targeting '$procName'" -ForegroundColor DarkGray; Start-Sleep -Seconds $wait }
+    
     # Launch if needed
-    Launch-IfNeeded -Entry $Entry
-
-    # Window appearance waits
-    $retryDelay=[int]($Entry.retryDelaySeconds ?? 1)
-    $retryCount=[int]($Entry.retryCount ?? 0)
-
-    # If a specific launch timeout is set, override retries to match it
-    $launchTimeout = [int]($Entry.launchTimeoutSeconds ?? 0)
-    if ($launchTimeout -gt 0 -and $retryDelay -gt 0) {
-        $retryCount = [int][Math]::Ceiling($launchTimeout / $retryDelay)
-    }
-
-    $target = Wait-ForProcessWindow -ProcessName $procName -WindowTitlePattern $Entry.windowTitlePattern -RetryCount $retryCount -RetryDelaySeconds $retryDelay
-    if (-not $target) { Write-Host "[SKIP] '$procName' has no visible main window after retries."; return }
-
-    $rect = Compute-RectFromEntry -Entry $Entry
-    $h = $target.Handle; $pid=$target.Process.Id; $title=$target.Process.MainWindowTitle
-    $monitorIdx = ($Entry.monitorIndex ?? -1); $area = if ($monitorIdx -ge 0) { "monitor#$monitorIdx" } else { "primary monitor" }
-    $rectStr = "({0},{1},{2},{3})" -f $rect.X,$rect.Y,$rect.Width,$rect.Height
-
-    Write-Host "[MOVE] $procName (PID $pid) title='$title' -> $rectStr on $area (dpiMode=${($Entry.dpiMode ?? 'auto')})"
-    Move-WindowSmart -Handle $h -Rect $rect -Entry $Entry
-
+    Invoke-Launch -Entry $merged
+    
+    # Wait for window
+    $timeout = [int]($merged.launchTimeoutSeconds ?? 0)
+    $delay = [int]($merged.retryDelaySeconds ?? 1)
+    $retries = if ($timeout -gt 0 -and $delay -gt 0) { [int][Math]::Ceiling($timeout / $delay) } else { [int]($merged.retryCount ?? 0) }
+    
+    $target = Wait-ForWindow -ProcessName $procName -TitlePattern $merged.windowTitlePattern -Retries $retries -Delay $delay
+    if (-not $target) { Write-Host "[SKIP] '$procName' no visible window after waiting" -ForegroundColor Yellow; return }
+    
+    # Compute and apply
+    $rect = Compute-Rect -Entry $merged
+    $mon = $merged.monitorIndex ?? -1
+    $area = if ($mon -ge 0) { "monitor#$mon" } else { "primary" }
+    
+    Write-Host "[MOVE] $procName (PID $($target.Process.Id)) -> ($($rect.X),$($rect.Y),$($rect.Width),$($rect.Height)) on $area" -ForegroundColor Green
+    Move-Window -Handle $target.Handle -Rect $rect -Entry $merged
+    
+    # Verify
     $ver = New-Object RECT
-    [void][WindowNative]::GetWindowRect($h,[ref]$ver)
-    Write-Host ("[OK]   New rect: ({0},{1})-({2},{3})" -f $ver.Left,$ver.Top,$ver.Right,$ver.Bottom)
+    [void][Win32]::GetWindowRect($target.Handle, [ref]$ver)
+    Write-Host "[OK]   Now at ($($ver.Left),$($ver.Top))-($($ver.Right),$($ver.Bottom))" -ForegroundColor DarkGray
 }
 
-# -------- Bundles (multi-window presets) ----------
-function Resolve-EntriesFromConfig {
-    param($Config,[string]$BundleToApply)
-    if ($BundleToApply) {
-        if (-not $Config.PSObject.Properties.Name -contains 'bundles') { throw "No 'bundles' found in config." }
-        $bundle = $Config.bundles.$BundleToApply
-        if (-not $bundle) { throw "Bundle '$BundleToApply' not found." }
-        $defaults = $Config.bundleDefaults
-        return @([pscustomobject]@{ Defaults=$defaults; Items=$bundle })
-    }
+function Get-LayoutConfig($Path) {
+    if (-not (Test-Path -LiteralPath $Path)) { throw "Config not found: $Path" }
+    return Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
+}
 
-    if ($Config -is [System.Collections.IEnumerable] -and -not ($Config.PSObject.Properties.Name -contains 'entries')) {
-        return @([pscustomobject]@{ Defaults=$null; Items=$Config })
+function Resolve-Bundles($Config, $BundleName) {
+    if ($BundleName) {
+        if (-not $Config.bundles.$BundleName) { throw "Bundle '$BundleName' not found" }
+        return @([PSCustomObject]@{ Defaults = $Config.bundleDefaults; Items = $Config.bundles.$BundleName })
     }
-
-    $all = @()
+    
+    if ($Config -is [System.Collections.IEnumerable] -and -not $Config.bundles) {
+        return @([PSCustomObject]@{ Defaults = $null; Items = $Config })
+    }
+    
+    $groups = [System.Collections.Generic.List[object]]::new()
     $defaults = $Config.bundleDefaults
-
-    if ($Config.PSObject.Properties.Name -contains 'applyBundles') {
+    
+    if ($Config.applyBundles) {
         foreach ($name in $Config.applyBundles) {
-            $b = $Config.bundles.$name
-            if (-not $b) { Write-Warning "applyBundles references missing bundle '$name'"; continue }
-            $all += [pscustomobject]@{ Defaults=$defaults; Items=$b }
+            if (-not $Config.bundles.$name) { Write-Warning "Missing bundle: $name"; continue }
+            $groups.Add([PSCustomObject]@{ Defaults = $defaults; Items = $Config.bundles.$name })
         }
     }
-    if ($Config.PSObject.Properties.Name -contains 'entries' -and $Config.entries) {
-        $all += [pscustomobject]@{ Defaults=$defaults; Items=$Config.entries }
+    if ($Config.entries) {
+        $groups.Add([PSCustomObject]@{ Defaults = $defaults; Items = $Config.entries })
     }
-    return ,$all
+    
+    return $groups
 }
 
-# -------- Recorder ----------
-function Get-WindowRectObject {
-    param([IntPtr]$Handle)
+function Get-WindowRect($Handle) {
     $r = New-Object RECT
-    [void][WindowNative]::GetWindowRect($Handle,[ref]$r)
-    [pscustomobject]@{ Left=$r.Left; Top=$r.Top; Right=$r.Right; Bottom=$r.Bottom; Width=($r.Right-$r.Left); Height=($r.Bottom-$r.Top) }
+    [void][Win32]::GetWindowRect($Handle, [ref]$r)
+    return [PSCustomObject]@{ Left = $r.Left; Top = $r.Top; Right = $r.Right; Bottom = $r.Bottom; Width = $r.Right - $r.Left; Height = $r.Bottom - $r.Top }
 }
-function Record-WindowLayout {
-    param([string[]]$Processes,[string]$Path,[string]$BundleName)
-    if (-not $Processes -or $Processes.Count -eq 0) { throw "Specify one or more -Process names to record (e.g., -Process code,chrome,notepad)." }
-    $entries = New-Object System.Collections.Generic.List[object]
+
+function Record-Layout {
+    param([string[]]$Processes, [string]$Path, [string]$BundleName)
+    
+    if (-not $Processes) { throw "Specify -Process names to record" }
+    
+    $entries = [System.Collections.Generic.List[object]]::new()
     foreach ($name in $Processes) {
         $procs = Get-Process -Name $name -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 }
-        if (-not $procs) { Write-Warning "No visible main window for process '$name'."; continue }
+        if (-not $procs) { Write-Warning "No visible window for: $name"; continue }
+        
         foreach ($p in $procs) {
             $h = [IntPtr]$p.MainWindowHandle
-            if (-not [WindowNative]::IsWindowVisible($h)) { continue }
-            $rect = Get-WindowRectObject -Handle $h
-            $idx  = Get-ScreenIndexFromHandle -Handle $h
-            $wa   = Get-WorkingArea -MonitorIndex $idx
-            $xRel = [int]($rect.Left - $wa.Left)
-            $yRel = [int]($rect.Top  - $wa.Top)
-            $entry = [ordered]@{
-                processName        = $p.ProcessName
-                monitorIndex       = $idx
-                x                  = $xRel
-                y                  = $yRel
-                width              = [int]$rect.Width
-                height             = [int]$rect.Height
+            if (-not [Win32]::IsWindowVisible($h)) { continue }
+            
+            $rect = Get-WindowRect -Handle $h
+            $idx = Get-MonitorFromHandle -Handle $h
+            $wa = Get-WorkingArea -MonitorIndex $idx
+            
+            $entries.Add([ordered]@{
+                processName = $p.ProcessName
+                monitorIndex = $idx
+                x = [int]($rect.Left - $wa.Left)
+                y = [int]($rect.Top - $wa.Top)
+                width = [int]$rect.Width
+                height = [int]$rect.Height
                 windowTitlePattern = [regex]::Escape($p.MainWindowTitle)
-                dpiMode            = 'physical'
-            }
-            [void]$entries.Add([pscustomobject]$entry)
+                dpiMode = 'physical'
+            })
         }
     }
-    if ($entries.Count -eq 0) { throw "Nothing recorded. Are those apps open with visible windows?" }
-
-    $existing = $null
-    if (Test-Path -LiteralPath $Path) { try { $existing = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json } catch {} }
-
+    
+    if ($entries.Count -eq 0) { throw "Nothing recorded. Are the apps open with visible windows?" }
+    
+    $existing = if (Test-Path -LiteralPath $Path) { 
+        try { Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json } catch { $null }
+    } else { $null }
+    
     if ($BundleName) {
-        if (-not $existing) { $existing = [pscustomobject]@{ bundles=@{}; applyBundles=@(); entries=@(); bundleDefaults=@{} } }
-        if (-not ($existing.PSObject.Properties.Name -contains 'bundles')) { $existing | Add-Member -NotePropertyName bundles -NotePropertyValue @{} -Force }
+        if (-not $existing) { $existing = [PSCustomObject]@{ bundles = @{}; applyBundles = @(); entries = @() } }
+        if (-not $existing.bundles) { $existing | Add-Member -NotePropertyName bundles -NotePropertyValue @{} -Force }
         $existing.bundles | Add-Member -NotePropertyName $BundleName -NotePropertyValue $entries -Force
-        if (-not ($existing.applyBundles -contains $BundleName)) { $existing.applyBundles += $BundleName }
-        $outputObj = $existing
+        if ($existing.applyBundles -notcontains $BundleName) { $existing.applyBundles += $BundleName }
+        $output = $existing
     } else {
-        if ($existing -and ($existing.PSObject.Properties.Name -contains 'entries')) { $existing.entries += $entries; $outputObj=$existing }
-        elseif ($existing -and $existing -is [System.Collections.IEnumerable]) { $outputObj = $existing + $entries }
-        else { $outputObj = $entries }
+        if ($existing -and $existing.entries) { $existing.entries += $entries; $output = $existing }
+        elseif ($existing -and $existing -is [System.Collections.IEnumerable]) { $output = $existing + $entries }
+        else { $output = $entries }
     }
-
-    $json = $outputObj | ConvertTo-Json -Depth 10
-    Set-Content -LiteralPath $Path -Value $json -Encoding UTF8
-    Write-Host "[RECORDED] Wrote $($entries.Count) entries to $Path" -ForegroundColor Green
-    if ($BundleName) { Write-Host "[BUNDLE] Bundle '$BundleName' updated/created in config." -ForegroundColor Green }
+    
+    $output | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $Path -Encoding UTF8
+    Write-Host "[RECORDED] $($entries.Count) entries to $Path" -ForegroundColor Green
+    if ($BundleName) { Write-Host "[BUNDLE] Created/updated bundle: $BundleName" -ForegroundColor Green }
 }
+#endregion
 
-# =========================
-#   MAIN
-# =========================
+#region Main
 try {
-    if ($Record) { Record-WindowLayout -Processes $Process -Path $OutputPath -BundleName $RecordBundleName; exit 0 }
-
-    $config = Read-WindowLayoutConfig -Path $OutputPath
-    $groups = Resolve-EntriesFromConfig -Config $config -BundleToApply $BundleToApply
-
-    foreach ($g in $groups) {
-        foreach ($entry in $g.Items) {
-            try { Apply-WindowLayoutEntry -Entry $entry -BundleDefaults $g.Defaults }
-            catch { Write-Warning ("[FAIL] {0}: {1}" -f ($entry.processName ?? '<unknown>'), $_.Exception.Message) }
+    if ($Record) {
+        Record-Layout -Processes $Process -Path $Path -BundleName $RecordBundleName
+        exit 0
+    }
+    
+    $config = Get-LayoutConfig -Path $Path
+    $groups = Resolve-Bundles -Config $config -BundleName $BundleToApply
+    
+    foreach ($group in $groups) {
+        foreach ($entry in $group.Items) {
+            try { Apply-Entry -Entry $entry -Defaults $group.Defaults }
+            catch { Write-Warning "[FAIL] $($entry.processName ?? '?'): $($_.Exception.Message)" }
         }
     }
+} catch {
+    Write-Error $_
+    exit 1
 }
-catch { Write-Error $_; exit 1 }
+#endregion
